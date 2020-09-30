@@ -25,12 +25,10 @@ import tensorflow as tf
 from .base import BaseModel
 from ..loss import Seq2SeqSparseCategoricalCrossentropy
 from ..metrics import Seq2SeqSparseCategoricalAccuracy
-from ..utils.misc import generate_square_subsequent_mask, insert_sos_in_labels
+from ..utils.misc import generate_square_subsequent_mask, insert_sos_in_labels, create_multihead_mask
 from ..layers.commons import PositionalEncoding
 from ..layers.transformer import Transformer
 from ..utils.hparam import register_and_parse_hparams
-from ..tools.beam_search import BeamSearchDecoder
-from ..tools.lm_scorer import NGramScorer, RNNScorer
 
 
 class SpeechTransformer(BaseModel):
@@ -47,7 +45,9 @@ class SpeechTransformer(BaseModel):
         "dff": 1280,
         "rate": 0.1,
         "schedual_sampling_rate": 0.9,
-        "label_smoothing_rate": 0.0
+        "label_smoothing_rate": 0.0,
+        "unidirectional": False,
+        "look_ahead": 0
     }
 
     def __init__(self, data_descriptions, config=None):
@@ -62,6 +62,11 @@ class SpeechTransformer(BaseModel):
             num_classes=self.num_class, eos=self.eos, label_smoothing=ls_rate
         )
         self.metric = Seq2SeqSparseCategoricalAccuracy(eos=self.eos, name="Accuracy")
+
+        # for deployment
+        self.data_descriptions = data_descriptions
+        self.deploy_encoder = None
+        self.deploy_decoder = None
 
         # for the x_net
         num_filters = self.hparams.num_filters
@@ -115,6 +120,8 @@ class SpeechTransformer(BaseModel):
             self.hparams.num_decoder_layers,
             self.hparams.dff,
             self.hparams.rate,
+            unidirectional=self.hparams.unidirectional,
+            look_ahead=self.hparams.look_ahead
         )
 
         # last layer for output
@@ -129,7 +136,7 @@ class SpeechTransformer(BaseModel):
         x = self.x_net(x0, training=training)
         y = self.y_net(y0, training=training)
         input_length = self.compute_logit_length(samples)
-        input_mask, output_mask = self._create_masks(x, input_length, y0)
+        input_mask, output_mask = create_multihead_mask(x, input_length, y0)
         y, encoder_output = self.transformer(
             x,
             y,
@@ -144,26 +151,6 @@ class SpeechTransformer(BaseModel):
             return y, encoder_output
         return y
 
-    @staticmethod
-    def _create_masks(x, input_length, y):
-        r""" Generate a square mask for the sequence. The masked positions are
-        filled with float(1.0). Unmasked positions are filled with float(0.0).
-        """
-        input_mask, output_mask = None, None
-        if x is not None:
-            input_mask = 1.0 - tf.sequence_mask(
-                input_length, tf.shape(x)[1], dtype=tf.float32
-            )
-            input_mask = input_mask[:, tf.newaxis, tf.newaxis, :]
-            input_mask.set_shape([None, None, None, None])
-        if y is not None:
-            output_mask = tf.cast(tf.math.equal(y, 0), tf.float32)
-            output_mask = output_mask[:, tf.newaxis, tf.newaxis, :]
-            look_ahead_mask = generate_square_subsequent_mask(tf.shape(y)[1])
-            output_mask = tf.maximum(output_mask, look_ahead_mask)
-            output_mask.set_shape([None, None, None, None])
-        return input_mask, output_mask
-
     def compute_logit_length(self, samples):
         """ used for get logit length """
         input_length = tf.cast(samples["input_length"], tf.float32)
@@ -173,11 +160,18 @@ class SpeechTransformer(BaseModel):
         return logit_length
 
     def time_propagate(self, history_logits, history_predictions, step, enc_outputs):
-        """ TODO: doctring
-        last_predictions: the predictions of last time_step, [beam_size]
-        history_predictions: the predictions of history from 0 to time_step,
-            [beam_size, time_steps]
-        states: (step)
+        """
+        Args:
+            history_logits: the logits of history from 0 to time_step, type: TensorArray
+            history_predictions: the predictions of history from 0 to time_step,
+                type: TensorArray
+            step: current step
+            enc_outputs: encoder outputs and its corresponding memory mask, type: tuple
+        Returns::
+
+            logits: new logits
+            history_logits: the logits array with new logits
+            step: next step
         """
         # merge
         (encoder_output, memory_mask) = enc_outputs
@@ -197,13 +191,32 @@ class SpeechTransformer(BaseModel):
         history_logits = history_logits.write(step - 1, logits)
         return logits, history_logits, step
 
-    def decode(self, samples, hparams, lm_model=None, return_encoder=False):
-        """ beam search decoding """
+    def decode(self, samples, hparams, decoder, return_encoder=False):
+        """ beam search decoding
+
+        Args:
+            samples: the data source to be decoded
+            hparams: decoding configs are included here
+            decoder: it contains the main decoding operations
+            return_encoder: if it is True,
+                encoder_output and input_mask will be returned
+        Returns::
+
+            predictions: the corresponding decoding results
+                shape: [batch_size, seq_length]
+                it will be returned only if return_encoder is False
+            encoder_output: the encoder output computed in decode mode
+                shape: [batch_size, seq_length, hsize]
+            input_mask: it is masked by input length
+                shape: [batch_size, 1, 1, seq_length]
+                encoder_output and input_mask will be returned
+                only if return_encoder is True
+        """
         x0 = samples["input"]
         batch = tf.shape(x0)[0]
         x = self.x_net(x0, training=False)
         input_length = self.compute_logit_length(samples)
-        input_mask, _ = self._create_masks(x, input_length, None)
+        input_mask, _ = create_multihead_mask(x, input_length, None)
         encoder_output = self.transformer.encoder(x, input_mask, training=False)
         if return_encoder:
             return encoder_output, input_mask
@@ -217,28 +230,7 @@ class SpeechTransformer(BaseModel):
         history_predictions = history_predictions.stack()
         init_cand_states = [history_predictions]
 
-        beam_size = 1 if not hparams.beam_search else hparams.beam_size
-        beam_search_decoder = BeamSearchDecoder(
-            self.num_class, self.sos, self.eos, beam_size=beam_size
-        )
-        beam_search_decoder.build(self.time_propagate)
-        if hparams.lm_weight != 0:
-            if hparams.lm_path is None:
-                raise ValueError("lm path should not be none")
-            if hparams.lm_type == "ngram":
-                lm_scorer = NGramScorer(
-                    hparams.lm_path,
-                    self.sos,
-                    self.eos,
-                    self.num_class,
-                    lm_weight=hparams.lm_weight,
-                )
-            elif hparams.lm_type == "rnn":
-                lm_scorer = RNNScorer(
-                    lm_model,
-                    lm_weight=hparams.lm_weight)
-            beam_search_decoder.add_scorer(lm_scorer)
-        predictions = beam_search_decoder(
+        predictions = decoder(
             history_predictions, init_cand_states, step, (encoder_output, input_mask)
         )
         return predictions
@@ -260,6 +252,85 @@ class SpeechTransformer(BaseModel):
             raise ValueError("NOT SUPPORTED")
 
 
+    def deploy(self):
+        """ deployment function """
+        layers = tf.keras.layers
+        input_samples = {
+            "input": layers.Input(shape=self.data_descriptions.sample_shape["input"],
+                                    dtype=tf.float32, name="deploy_encoder_input_seq"),
+            "input_length": layers.Input(shape=self.data_descriptions.sample_shape["input_length"],
+                                    dtype=tf.int32, name="deploy_encoder_input_length")
+        }
+        x = self.x_net(input_samples["input"], training=False)
+        input_length = self.compute_logit_length(input_samples)
+        input_mask, _ = create_multihead_mask(x, input_length, None)
+        encoder_output = self.transformer.encoder(x, input_mask, training=False)
+        self.deploy_encoder = tf.keras.Model(inputs=[input_samples["input"],
+                                                     input_samples["input_length"]],
+                                             outputs=[encoder_output, input_mask],
+                                             name="deploy_encoder_model")
+        print(self.deploy_encoder.summary())
+
+
+        decoder_encoder_output = layers.Input(shape=tf.TensorShape([None, self.hparams.d_model]),
+                                        dtype=tf.float32, name="deploy_decoder_encoder_output")
+        memory_mask = layers.Input(shape=tf.TensorShape([None, None, None]),
+                                        dtype=tf.float32, name="deploy_decoder_memory_mask")
+        step = layers.Input(shape=tf.TensorShape([]), dtype=tf.int32, name="deploy_decoder_step")
+        history_predictions = layers.Input(shape=tf.TensorShape([None]),
+                                        dtype=tf.float32, name="deploy_decoder_history_predictions")
+
+        # propagate one step
+        output_mask = generate_square_subsequent_mask(step[0])
+        logits = self.y_net(history_predictions, training=False)
+        logits = self.transformer.decoder(
+            logits,
+            decoder_encoder_output,
+            tgt_mask=output_mask,
+            memory_mask=memory_mask,
+            training=False,
+        )
+        logits = self.final_layer(logits)
+        logits = logits[:, -1, :]
+        self.deploy_decoder = tf.keras.Model(inputs=[decoder_encoder_output,
+                                                     memory_mask,
+                                                     step,
+                                                     history_predictions],
+                                             outputs=[logits],
+                                             name="deploy_decoder_model")
+        print(self.deploy_decoder.summary())
+
+    def inference_one_step(self, enc_outputs, cur_input, inner_packed_states_array):
+        """call back function for WFST decoder
+
+        Args:
+          enc_outputs: outputs and mask of encoder
+          cur_input: input sequence for transformer, type: list
+          inner_packed_states_array: inner states need to be record, type: tuple
+        Returns::
+
+          scores: log scores for all labels
+          inner_packed_states_array: inner states for next iterator
+        """
+        (encoder_output, memory_mask) = enc_outputs
+        batch_size = len(cur_input)
+        encoder_output = tf.tile(encoder_output, [batch_size, 1, 1])
+        memory_mask = tf.tile(memory_mask, [batch_size, 1, 1, 1])
+        assert batch_size == len(inner_packed_states_array)
+        (step,) = inner_packed_states_array[0]
+        step += 1
+        output_mask = generate_square_subsequent_mask(step)
+        cur_input = tf.constant(cur_input, dtype=tf.float32)
+        cur_input = self.y_net(cur_input, training=False)
+        logits = self.transformer.decoder(cur_input, encoder_output, tgt_mask=output_mask,
+                                          memory_mask=memory_mask, training=False)
+        logits = self.final_layer(logits)
+        logits = logits[:, -1, :]
+        Z = tf.reduce_logsumexp(logits, axis=(1,), keepdims=True)
+        logprobs = logits - Z
+        return logprobs.numpy(), [(step,) for _ in range(batch_size)]
+
+
 class SpeechTransformer2(SpeechTransformer):
     """ Decoder for SpeechTransformer2 works for two pass schedual sampling"""
 
@@ -269,7 +340,7 @@ class SpeechTransformer2(SpeechTransformer):
         x = self.x_net(x0, training=training)
         y = self.y_net(y0, training=training)
         input_length = self.compute_logit_length(samples)
-        input_mask, output_mask = self._create_masks(x, input_length, y0)
+        input_mask, output_mask = create_multihead_mask(x, input_length, y0)
         # first pass
         y, encoder_output = self.transformer(
             x,
@@ -299,25 +370,31 @@ class SpeechTransformer2(SpeechTransformer):
 
     def mix_target_sequence(self, gold_token, predicted_token, training, top_k=5):
         """ to mix gold token and prediction
-        param gold_token: true labels
-        param predicted_token: predictions by first pass
-        return: mix of the gold_token and predicted_token
+
+        Args:
+            gold_token: true labels
+            predicted_token: predictions by first pass
+            training: if it is in the training stage
+            top_k: the number of predicted indexes selected for next step calculation
+        Returns::
+
+            final_input: mix of the gold_token and predicted_token
         """
         mix_result = tf.TensorArray(
             tf.float32, size=1, dynamic_size=True, clear_after_read=False
         )
         for i in tf.range(tf.shape(gold_token)[-1]):
             if self.random_num([1]) > self.hparams.schedual_sampling_rate:# do schedual sampling
-                selected_input = predicted_token[:,i,:]
-                selected_idx = tf.nn.top_k(selected_input,top_k).indices
+                selected_input = predicted_token[:, i, :]
+                selected_idx = tf.nn.top_k(selected_input, top_k).indices
                 embedding_input = self.y_net.layers[1](selected_idx, training=training)
                 embedding_input = tf.reduce_mean(embedding_input, axis=1)
-                mix_result = mix_result.write(i,embedding_input)
+                mix_result = mix_result.write(i, embedding_input)
             else:
-                selected_input = tf.reshape(gold_token[:,i], [-1,1])
+                selected_input = tf.reshape(gold_token[:, i], [-1, 1])
                 embedding_input = self.y_net.layers[1](selected_input, training=training)
-                mix_result = mix_result.write(i, embedding_input[:,0,:])
-        final_input = self.y_net.layers[2](tf.transpose(mix_result.stack(),[1,0,2]),
+                mix_result = mix_result.write(i, embedding_input[:, 0, :])
+        final_input = self.y_net.layers[2](tf.transpose(mix_result.stack(), [1, 0, 2]),
                                            training=training)
         final_input = self.y_net.layers[3](final_input, training=training)
         return final_input

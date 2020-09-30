@@ -24,12 +24,7 @@ from .commons import ACTIVATIONS
 
 
 class Transformer(tf.keras.layers.Layer):
-    """A transformer model. User is able to modify the attributes as needed. The architecture
-    is based on the paper "Attention Is All You Need". Ashish Vaswani, Noam Shazeer,
-    Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Lukasz Kaiser, and
-    Illia Polosukhin. 2017. Attention is all you need. In Advances in Neural Information
-    Processing Systems, pages 6000-6010. Users can build the BERT(https://arxiv.org/abs/1810.04805)
-    model with corresponding parameters.
+    """A transformer model. User is able to modify the attributes as needed.
 
     Args:
         d_model: the number of expected features in the encoder/decoder inputs (default=512).
@@ -43,7 +38,7 @@ class Transformer(tf.keras.layers.Layer):
         custom_encoder: custom encoder (default=None).
         custom_decoder: custom decoder (default=None).
 
-    Examples::
+    Examples:
         >>> transformer_model = Transformer(nhead=16, num_encoder_layers=12)
         >>> src = tf.random.normal((10, 32, 512))
         >>> tgt = tf.random.normal((20, 32, 512))
@@ -62,6 +57,8 @@ class Transformer(tf.keras.layers.Layer):
         dim_feedforward=2048,
         dropout=0.1,
         activation="gelu",
+        unidirectional=False,
+        look_ahead=0,
         custom_encoder=None,
         custom_decoder=None,
     ):
@@ -71,7 +68,8 @@ class Transformer(tf.keras.layers.Layer):
         else:
             encoder_layers = [
                 TransformerEncoderLayer(
-                    d_model, nhead, dim_feedforward, dropout, activation
+                    d_model, nhead, dim_feedforward,
+                    dropout, activation, unidirectional, look_ahead
                 )
                 for _ in range(num_encoder_layers)
             ]
@@ -92,7 +90,7 @@ class Transformer(tf.keras.layers.Layer):
         self.nhead = nhead
 
     def call(self, src, tgt, src_mask=None, tgt_mask=None, memory_mask=None,
-             return_encoder_output=False, training=None):
+             return_encoder_output=False, return_attention_weights=False, training=None):
         """Take in and process masked source/target sequences.
 
         Args:
@@ -140,7 +138,8 @@ class Transformer(tf.keras.layers.Layer):
 
         memory = self.encoder(src, src_mask=src_mask, training=training)
         output = self.decoder(
-            tgt, memory, tgt_mask=tgt_mask, memory_mask=memory_mask, training=training
+            tgt, memory, tgt_mask=tgt_mask, memory_mask=memory_mask,
+            return_attention_weights=return_attention_weights, training=training
         )
         if return_encoder_output:
             return output, memory
@@ -155,7 +154,7 @@ class TransformerEncoder(tf.keras.layers.Layer):
         num_layers: the number of sub-encoder-layers in the encoder (required).
         norm: the layer normalization component (optional).
 
-    Examples::
+    Examples:
         >>> encoder_layer = [TransformerEncoderLayer(d_model=512, nhead=8)
         >>>                    for _ in range(num_layers)]
         >>> transformer_encoder = TransformerEncoder(encoder_layer)
@@ -173,14 +172,17 @@ class TransformerEncoder(tf.keras.layers.Layer):
         Args:
             src: the sequnce to the encoder (required).
             mask: the mask for the src sequence (optional).
-
-        Shape:
-            see the docs in Transformer class.
         """
         output = src
         for i in range(len(self.layers)):
             output = self.layers[i](output, src_mask=src_mask, training=training)
         return output
+
+    def set_unidirectional(self, uni=False):
+        """whether to apply trianglar masks to make transformer unidirectional
+        """
+        for layer in self.layers:
+            layer.set_unidirectional(uni)
 
 
 class TransformerDecoder(tf.keras.layers.Layer):
@@ -191,7 +193,7 @@ class TransformerDecoder(tf.keras.layers.Layer):
         num_layers: the number of sub-decoder-layers in the decoder (required).
         norm: the layer normalization component (optional).
 
-    Examples::
+    Examples:
         >>> decoder_layer = [TransformerDecoderLayer(d_model=512, nhead=8)
         >>>                     for _ in range(num_layers)]
         >>> transformer_decoder = TransformerDecoder(decoder_layer)
@@ -204,7 +206,8 @@ class TransformerDecoder(tf.keras.layers.Layer):
         super().__init__()
         self.layers = decoder_layers
 
-    def call(self, tgt, memory, tgt_mask=None, memory_mask=None, training=None):
+    def call(self, tgt, memory, tgt_mask=None, memory_mask=None, return_attention_weights=False,
+             training=None):
         """Pass the inputs (and mask) through the decoder layer in turn.
 
         Args:
@@ -213,30 +216,26 @@ class TransformerDecoder(tf.keras.layers.Layer):
             tgt_mask: the mask for the tgt sequence (optional).
             memory_mask: the mask for the memory sequence (optional).
 
-        Shape:
-            see the docs in Transformer class.
         """
         output = tgt
+        attention_weights = []
 
         for i in range(len(self.layers)):
-            output = self.layers[i](
+            output, attention_weight = self.layers[i](
                 output,
                 memory,
                 tgt_mask=tgt_mask,
                 memory_mask=memory_mask,
                 training=training,
             )
-
+            attention_weights.append(attention_weight)
+        if return_attention_weights:
+            return output, attention_weights
         return output
 
 
 class TransformerEncoderLayer(tf.keras.layers.Layer):
     """TransformerEncoderLayer is made up of self-attn and feedforward network.
-    This standard encoder layer is based on the paper "Attention Is All You Need".
-    Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
-    Lukasz Kaiser, and Illia Polosukhin. 2017. Attention is all you need. In Advances in
-    Neural Information Processing Systems, pages 6000-6010. Users may modify or implement
-    in a different way during application.
 
     Args:
         d_model: the number of expected features in the input (required).
@@ -245,54 +244,56 @@ class TransformerEncoderLayer(tf.keras.layers.Layer):
         dropout: the dropout value (default=0.1).
         activation: the activation function of intermediate layer, relu or gelu (default=relu).
 
-    Examples::
+    Examples:
         >>> encoder_layer = TransformerEncoderLayer(d_model=512, nhead=8)
         >>> src = tf.random(10, 32, 512)
         >>> out = encoder_layer(src)
     """
 
     def __init__(
-        self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="gelu"
+        self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="gelu",
+            unidirectional=False, look_ahead=0, ffn=None
     ):
         super().__init__()
-        self.self_attn = MultiHeadAttention(d_model, nhead)
+        self.self_attn = MultiHeadAttention(d_model, nhead, unidirectional, look_ahead=look_ahead)
         # Implementation of Feedforward model
         layers = tf.keras.layers
-        self.ffn = tf.keras.Sequential(
-            [
-                layers.Dense(
-                    dim_feedforward,
-                    activation=ACTIVATIONS[activation],
-                    kernel_initializer=tf.compat.v1.truncated_normal_initializer(
-                        stddev=0.02
+        if ffn is None:
+            self.ffn = tf.keras.Sequential(
+                [
+                    layers.Dense(
+                        dim_feedforward,
+                        activation=ACTIVATIONS[activation],
+                        kernel_initializer=tf.compat.v1.truncated_normal_initializer(
+                            stddev=0.02
+                        ),
+                        input_shape=(d_model,),
                     ),
-                    input_shape=(d_model,),
-                ),
-                layers.Dropout(dropout, input_shape=(dim_feedforward,)),
-                layers.Dense(
-                    d_model,
-                    kernel_initializer=tf.compat.v1.truncated_normal_initializer(
-                        stddev=0.02
+                    layers.Dropout(dropout, input_shape=(dim_feedforward,)),
+                    layers.Dense(
+                        d_model,
+                        kernel_initializer=tf.compat.v1.truncated_normal_initializer(
+                            stddev=0.02
+                        ),
+                        input_shape=(dim_feedforward,),
                     ),
-                    input_shape=(dim_feedforward,),
-                ),
-                layers.Dropout(dropout, input_shape=(d_model,)),
-            ]
-        )
+                    layers.Dropout(dropout, input_shape=(d_model,)),
+                ]
+            )
+        else:
+            self.ffn = ffn
 
         self.norm1 = layers.LayerNormalization(epsilon=1e-8, input_shape=(d_model,))
         self.norm2 = layers.LayerNormalization(epsilon=1e-8, input_shape=(d_model,))
         self.dropout = layers.Dropout(dropout, input_shape=(d_model,))
 
     def call(self, src, src_mask=None, training=None):
-        """Pass the input through the endocder layer.
+        """Pass the input through the encoder layer.
 
         Args:
-            src: the sequnce to the encoder layer (required).
+            src: the sequence to the encoder layer (required).
             mask: the mask for the src sequence (optional).
 
-        Shape:
-            see the docs in Transformer class.
         """
         out = self.self_attn(src, src, src, mask=src_mask)[0]
         out = self.norm1(src + self.dropout(out, training=training))
@@ -300,15 +301,18 @@ class TransformerEncoderLayer(tf.keras.layers.Layer):
 
         return out
 
+    def set_unidirectional(self, uni=False):
+        """whether to apply trianglar masks to make transformer unidirectional
+        """
+        self.self_attn.attention.uni = uni
+
 
 class TransformerDecoderLayer(tf.keras.layers.Layer):
     """TransformerDecoderLayer is made up of self-attn, multi-head-attn and feedforward network.
-    This standard decoder layer is based on the paper "Attention Is All You Need".
-    Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
-    Lukasz Kaiser, and Illia Polosukhin. 2017. Attention is all you need. In Advances in
-    Neural Information Processing Systems, pages 6000-6010. Users may modify or implement
-    in a different way during application.
 
+    Reference: 
+        "Attention Is All You Need".
+        
     Args:
         d_model: the number of expected features in the input (required).
         nhead: the number of heads in the multiheadattention models (required).
@@ -316,7 +320,7 @@ class TransformerDecoderLayer(tf.keras.layers.Layer):
         dropout: the dropout value (default=0.1).
         activation: the activation function of intermediate layer, relu or gelu (default=relu).
 
-    Examples::
+    Examples:
         >>> decoder_layer = TransformerDecoderLayer(d_model=512, nhead=8)
         >>> memory = tf.random(10, 32, 512)
         >>> tgt = tf.random(20, 32, 512)
@@ -364,16 +368,14 @@ class TransformerDecoderLayer(tf.keras.layers.Layer):
 
         Args:
             tgt: the sequence to the decoder layer (required).
-            memory: the sequnce from the last layer of the encoder (required).
+            memory: the sequence from the last layer of the encoder (required).
             tgt_mask: the mask for the tgt sequence (optional).
             memory_mask: the mask for the memory sequence (optional).
 
-        Shape:
-            see the docs in Transformer class.
         """
         out = self.attn1(tgt, tgt, tgt, mask=tgt_mask)[0]
         out = self.norm1(tgt + self.dropout1(out, training=training))
-        out2 = self.attn2(memory, memory, out, mask=memory_mask)[0]
+        out2, decoder_weights = self.attn2(memory, memory, out, mask=memory_mask)
         out = self.norm2(out + self.dropout2(out2, training=training))
         out = self.norm3(out + self.ffn(out, training=training))
-        return out
+        return out, decoder_weights
